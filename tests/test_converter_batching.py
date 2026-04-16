@@ -39,17 +39,21 @@ class FakeGaussians3D:
     leading batch dimension).
     """
 
-    def __init__(self, batch_size: int = 1, num_points: int = 128):
+    def __init__(self, batch_size: int = 1, num_points: int = 128, *,
+                 mean_vectors=None, colors=None, singular_values=None,
+                 quaternions=None, opacities=None):
         self.batch_size = batch_size
         self.num_points = num_points
         # Representative tensor shapes: [B, P, C]
-        self.mean_vectors = torch.randn(batch_size, num_points, 3)
-        self.colors = torch.rand(batch_size, num_points, 3)
-        self.singular_values = torch.rand(batch_size, num_points, 3) * 0.01
-        self.opacities = torch.rand(batch_size, num_points, 1)
+        self.mean_vectors = mean_vectors if mean_vectors is not None else torch.randn(batch_size, num_points, 3)
+        self.colors = colors if colors is not None else torch.rand(batch_size, num_points, 3)
+        self.singular_values = singular_values if singular_values is not None else torch.rand(batch_size, num_points, 3) * 0.01
+        self.quaternions = quaternions if quaternions is not None else torch.randn(batch_size, num_points, 4)
+        self.opacities = opacities if opacities is not None else torch.rand(batch_size, num_points, 1)
         # Extra fields the real object may carry
         self._fields = [
-            "mean_vectors", "colors", "singular_values", "opacities",
+            "mean_vectors", "colors", "singular_values", "quaternions",
+            "opacities",
         ]
 
     def __getitem__(self, idx):
@@ -58,6 +62,7 @@ class FakeGaussians3D:
         g.mean_vectors = self.mean_vectors[idx : idx + 1]
         g.colors = self.colors[idx : idx + 1]
         g.singular_values = self.singular_values[idx : idx + 1]
+        g.quaternions = self.quaternions[idx : idx + 1]
         g.opacities = self.opacities[idx : idx + 1]
         return g
 
@@ -69,15 +74,28 @@ class FakeGaussians3D:
         g.mean_vectors = self.mean_vectors.cpu()
         g.colors = self.colors.cpu()
         g.singular_values = self.singular_values.cpu()
+        g.quaternions = self.quaternions.cpu()
         g.opacities = self.opacities.cpu()
+        return g
+
+    def to(self, device):
+        """Move all tensors to the given device."""
+        g = FakeGaussians3D(
+            batch_size=self.batch_size, num_points=self.num_points
+        )
+        g.mean_vectors = self.mean_vectors.to(device)
+        g.colors = self.colors.to(device)
+        g.singular_values = self.singular_values.to(device)
+        g.quaternions = self.quaternions.to(device)
+        g.opacities = self.opacities.to(device)
         return g
 
 
 class FakePredictor(torch.nn.Module):
     """
-    A mock predictor that accepts [B, 3, 1536, 1536] images and [B]
+    A mock predictor that accepts [B, 3, H, H] images and [B]
     disparity factors, returning a FakeGaussians3D with the correct
-    batch size.
+    batch size.  H defaults to 1024 (DEFAULT_INTERNAL_SHAPE).
     """
 
     def __init__(self, fail_above_batch: int = 0):
@@ -432,13 +450,14 @@ class TestPreprocessing:
     """Test the preprocessing helper in isolation."""
 
     def test_preprocess_output_shape(self):
-        """_preprocess_image should produce [1, 3, 1536, 1536] tensor."""
+        """_preprocess_image should produce [1, 3, H, H] tensor matching DEFAULT_INTERNAL_SHAPE."""
         project_root = str(Path(__file__).resolve().parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
 
         from scripts.converters.video_to_3d_high_quality import (
             _preprocess_image,
+            DEFAULT_INTERNAL_SHAPE,
         )
 
         image = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
@@ -448,7 +467,7 @@ class TestPreprocessing:
             image, 500.0, device
         )
 
-        assert img_resized.shape == (1, 3, 1536, 1536)
+        assert img_resized.shape == (1, 3, DEFAULT_INTERNAL_SHAPE[1], DEFAULT_INTERNAL_SHAPE[0])
         assert disp_factor.shape == (1,)
         assert h == 480
         assert w == 640
@@ -464,7 +483,7 @@ class TestPreprocessing:
 
         from scripts.converters.video_to_3d_high_quality import (
             _build_intrinsics,
-            INTERNAL_SHAPE,
+            DEFAULT_INTERNAL_SHAPE,
         )
 
         device = torch.device("cpu")
@@ -479,7 +498,7 @@ class TestPreprocessing:
 
         # K_resized scales rows 0 and 1
         assert abs(
-            K_resized[0, 0].item() - f_px * INTERNAL_SHAPE[0] / w
+            K_resized[0, 0].item() - f_px * DEFAULT_INTERNAL_SHAPE[0] / w
         ) < 1e-3
 
 

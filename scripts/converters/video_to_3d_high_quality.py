@@ -694,5 +694,9 @@ def main():
     print("\n" + "=" * 70 + "\n")
 
 
+# Backward-compatibility alias: external code may import the old name.
+INTERNAL_SHAPE = DEFAULT_INTERNAL_SHAPE
+
+
 if __name__ == "__main__":
     main()
