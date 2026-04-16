@@ -7,8 +7,10 @@ Gaussian Splat PLY file.  It batches SHARP inference for higher GPU
 utilisation and overlaps CPU-side PLY saving with the next GPU batch.
 """
 
+import os
 import sys
 import time
+import shutil
 import logging
 import argparse
 from pathlib import Path
@@ -90,6 +92,53 @@ def extract_all_frames(video_path: Path, output_dir: Path, frame_skip: int = 1) 
           f"{video_frame_count} video frames")
 
     return saved_frame_count
+
+
+# ---------------------------------------------------------------------------
+# Keyframe symlink helpers
+# ---------------------------------------------------------------------------
+
+def create_keyframe_symlinks(
+    gaussians_dir: Path,
+    total_frames: int,
+    keyframe_interval: int,
+) -> Tuple[int, int]:
+    """
+    Create symlinks for intermediate frames pointing to the nearest keyframe PLY.
+
+    For each non-keyframe frame index, creates a symlink (or copy as fallback)
+    in gaussians_dir pointing to the nearest keyframe's PLY file.
+
+    Args:
+        gaussians_dir: Directory containing keyframe PLY files.
+        total_frames: Total number of frames extracted.
+        keyframe_interval: Every Nth frame is a keyframe.
+
+    Returns:
+        Tuple of (symlinks_created, copies_created).
+    """
+    symlinks_created = 0
+    copies_created = 0
+
+    for k in range(0, total_frames, keyframe_interval):
+        keyframe_ply = gaussians_dir / f"frame_{k:06d}.ply"
+        if not keyframe_ply.exists():
+            continue
+
+        end = min(k + keyframe_interval, total_frames)
+        for j in range(k + 1, end):
+            link = gaussians_dir / f"frame_{j:06d}.ply"
+            if link.exists() or link.is_symlink():
+                continue
+            try:
+                os.symlink(keyframe_ply.name, str(link))
+                symlinks_created += 1
+            except OSError:
+                # Fallback for systems without symlink support (e.g. Windows)
+                shutil.copy2(str(keyframe_ply), str(link))
+                copies_created += 1
+
+    return symlinks_created, copies_created
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +277,7 @@ def convert_frames_to_3d(
     batch_size: int = 4,
     internal_shape=DEFAULT_INTERNAL_SHAPE,
     use_fp16: bool = True,
+    keyframe_interval: Optional[int] = None,
 ):
     """
     Convert all frames to 3D Gaussian Splats using SHARP Python API.
@@ -244,6 +294,8 @@ def convert_frames_to_3d(
             at small quality cost. Default 1024; model native is 1536.
         use_fp16: Run predictor under fp16 autocast on GPU devices. ~1.5-2x
             speedup on MPS/CUDA with negligible quality loss.
+        keyframe_interval: If set, only process every Nth frame through SHARP
+            and symlink intermediate frames to the nearest keyframe PLY.
     """
     from sharp.models import PredictorParams, create_predictor
     from sharp.utils import io
@@ -307,7 +359,21 @@ def convert_frames_to_3d(
         return False
 
     total_frames = len(image_paths)
-    print(f"\n    Processing {total_frames} frames "
+
+    # When keyframe_interval is set, only process keyframe images through SHARP
+    all_image_paths = image_paths  # keep full list for symlink creation
+    if keyframe_interval is not None:
+        keyframe_paths = [
+            p for i, p in enumerate(image_paths)
+            if i % keyframe_interval == 0
+        ]
+        print(f"\n    Keyframe mode: processing {len(keyframe_paths)} "
+              f"keyframes out of {total_frames} total frames "
+              f"(interval={keyframe_interval})")
+        image_paths = keyframe_paths
+
+    total_to_process = len(image_paths)
+    print(f"\n    Processing {total_to_process} frames "
           f"(batch_size={batch_size})...")
 
     # ------------------------------------------------------------------
@@ -324,8 +390,8 @@ def convert_frames_to_3d(
     # parallelism.  max_workers=2 keeps I/O busy without contention.
     with ThreadPoolExecutor(max_workers=2) as save_pool:
         batch_start = 0
-        while batch_start < total_frames:
-            batch_end = min(batch_start + batch_size, total_frames)
+        while batch_start < total_to_process:
+            batch_end = min(batch_start + batch_size, total_to_process)
             batch_paths = image_paths[batch_start:batch_end]
             current_batch_size = len(batch_paths)
 
@@ -350,7 +416,7 @@ def convert_frames_to_3d(
                     ))
                 except Exception as e:
                     print(f"\n    [{batch_start + len(frame_meta) + 1}/"
-                          f"{total_frames}] Error loading {img_path.name}: {e}")
+                          f"{total_to_process}] Error loading {img_path.name}: {e}")
                     continue
 
             if not images_resized_list:
@@ -401,7 +467,7 @@ def convert_frames_to_3d(
                                 )
                                 save_futures.append(fut)
                                 processed += 1
-                                print(f"    [{processed}/{total_frames}] "
+                                print(f"    [{processed}/{total_to_process}] "
                                       f"{out_path_i.name} (b=1)",
                                       end="\r")
                             except Exception as inner_e:
@@ -451,7 +517,7 @@ def convert_frames_to_3d(
                 )
                 save_futures.append(fut)
                 processed += 1
-                print(f"    [{processed}/{total_frames}] "
+                print(f"    [{processed}/{total_to_process}] "
                       f"{out_path_i.name}", end="\r")
 
             batch_start = batch_end
@@ -472,6 +538,21 @@ def convert_frames_to_3d(
           f"({fps:.2f} frames/sec)")
     if errors:
         print(f"    {errors} PLY save error(s) occurred.")
+
+    # Create symlinks for intermediate frames in keyframe mode
+    if keyframe_interval is not None:
+        symlinks, copies = create_keyframe_symlinks(
+            gaussians_dir, len(all_image_paths), keyframe_interval
+        )
+        total_links = symlinks + copies
+        print(f"\n    Keyframe summary:")
+        print(f"    Keyframes processed by SHARP: {processed}")
+        print(f"    Intermediate frames linked:   {total_links}"
+              f" ({symlinks} symlinks, {copies} copies)")
+        print(f"    Total PLY entries:            {processed + total_links}")
+        print(f"    Effective speedup:            "
+              f"~{len(all_image_paths) / max(processed, 1):.1f}x")
+
     print(f"    Successfully converted frames to 3D!")
     return True
 
@@ -593,6 +674,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "Slower but slightly higher fidelity.  GPU devices only."
         ),
     )
+    p.add_argument(
+        "--keyframe-interval",
+        type=int,
+        default=None,
+        metavar="N",
+        dest="keyframe_interval",
+        help=(
+            "Run SHARP only on every Nth frame (keyframes) and symlink "
+            "intermediate frames to the nearest keyframe PLY. This gives "
+            "full-framerate output with N times less GPU cost. When set, "
+            "all frames are extracted regardless of the 'skip' argument."
+        ),
+    )
 
     return p
 
@@ -617,6 +711,7 @@ def main():
     batch_size = args.batch_size
     internal_shape = (args.internal_shape, args.internal_shape)
     use_fp16 = not args.fp32
+    keyframe_interval = args.keyframe_interval
 
     if frame_skip < 1:
         print("Error: Frame skip must be >= 1")
@@ -630,6 +725,16 @@ def main():
         print("Error: --internal-shape must be in [64, 4096]")
         sys.exit(1)
 
+    if keyframe_interval is not None and keyframe_interval < 1:
+        print("Error: --keyframe-interval must be >= 1")
+        sys.exit(1)
+
+    # When keyframe-interval is set, override skip to extract all frames
+    if keyframe_interval is not None and frame_skip != 1:
+        print(f"\n    Note: --keyframe-interval is set; ignoring skip={frame_skip} "
+              f"and extracting all frames.")
+        frame_skip = 1
+
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
         sys.exit(1)
@@ -641,7 +746,10 @@ def main():
     print(f"\n    Input video: {video_path}")
     print(f"    Output directory: {output_dir}")
     print(f"    Device: {device}")
-    print(f"    Frame skip: Every {frame_skip} frame(s)")
+    if keyframe_interval is not None:
+        print(f"    Keyframe interval: Every {keyframe_interval} frame(s)")
+    else:
+        print(f"    Frame skip: Every {frame_skip} frame(s)")
     print(f"    Batch size: {batch_size}")
 
     # Step 1: Extract frames
@@ -663,6 +771,7 @@ def main():
         batch_size=batch_size,
         internal_shape=internal_shape,
         use_fp16=use_fp16,
+        keyframe_interval=keyframe_interval,
     )
 
     if not success:
@@ -679,7 +788,14 @@ def main():
     print(f"\n    Summary:")
     print(f"    Extracted frames: {num_frames}")
     print(f"    PLY files created: {len(ply_files)}")
-    if frame_skip > 1:
+    if keyframe_interval is not None:
+        keyframe_count = (num_frames + keyframe_interval - 1) // keyframe_interval
+        symlink_count = len(ply_files) - keyframe_count
+        print(f"    Keyframe interval: {keyframe_interval}")
+        print(f"    Keyframes (SHARP): {keyframe_count}")
+        print(f"    Symlinked frames:  {symlink_count}")
+        print(f"    Effective speedup: ~{num_frames / max(keyframe_count, 1):.1f}x")
+    elif frame_skip > 1:
         print(f"    Frame skip: Every {frame_skip} frame(s)")
     print(f"\n    Outputs:")
     print(f"    Frames: {output_dir / 'frames'}")
