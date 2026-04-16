@@ -278,6 +278,8 @@ def convert_frames_to_3d(
     internal_shape=DEFAULT_INTERNAL_SHAPE,
     use_fp16: bool = True,
     keyframe_interval: Optional[int] = None,
+    runtime: str = "pytorch",
+    coreml_model: str = "sharp.mlpackage",
 ):
     """
     Convert all frames to 3D Gaussian Splats using SHARP Python API.
@@ -296,10 +298,13 @@ def convert_frames_to_3d(
             speedup on MPS/CUDA with negligible quality loss.
         keyframe_interval: If set, only process every Nth frame through SHARP
             and symlink intermediate frames to the nearest keyframe PLY.
+        runtime: 'pytorch' or 'coreml'. CoreML gives ~1.5x on Apple Silicon.
+        coreml_model: Path to the exported .mlpackage (only with runtime='coreml').
     """
-    from sharp.models import PredictorParams, create_predictor
     from sharp.utils import io
     from sharp.utils.gaussians import save_ply
+
+    use_coreml = runtime == "coreml"
 
     gaussians_dir = output_dir / "gaussians"
     gaussians_dir.mkdir(parents=True, exist_ok=True)
@@ -307,45 +312,75 @@ def convert_frames_to_3d(
     print(f"\n--- Converting frames to 3D Gaussian Splats ---")
     print(f"    Input: {frames_dir}")
     print(f"    Output: {gaussians_dir}")
-    print(f"    Device: {device}")
-    print(f"    Batch size: {batch_size}")
-    print(f"    Internal shape: {internal_shape[0]}x{internal_shape[1]}")
-    print(f"    Precision: {'fp16 (autocast)' if use_fp16 else 'fp32'}")
+    print(f"    Runtime: {runtime}")
 
-    # Auto-detect device
-    if device == "default":
-        if torch.cuda.is_available():
-            device = "cuda"
-            print(f"    Using CUDA (GPU)")
-        elif torch.mps.is_available():
-            device = "mps"
-            print(f"    Using MPS (Apple Silicon GPU)")
-        else:
-            device = "cpu"
-            print(f"    Using CPU (will be slower)")
+    if use_coreml:
+        # CoreML path: fixed 1536x1536, batch=1, fp16 handled internally
+        from scripts.converters.coreml_predictor import CoreMLPredictor
 
-    device_obj = torch.device(device)
+        coreml_path = Path(coreml_model)
+        if not coreml_path.exists():
+            print(f"\n    Error: CoreML model not found at {coreml_path}")
+            print(f"    Export first: python3 scripts/export_coreml.py --output {coreml_model}")
+            return False
 
-    # Load model
-    print(f"\n    Loading SHARP model...")
-    DEFAULT_MODEL_URL = (
-        "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
-    )
+        print(f"    CoreML model: {coreml_path}")
+        print(f"    Loading CoreML predictor...")
+        gaussian_predictor = CoreMLPredictor(coreml_path)
+        print(f"    CoreML predictor loaded")
 
-    try:
-        print(f"    Downloading model from: {DEFAULT_MODEL_URL}")
-        state_dict = torch.hub.load_state_dict_from_url(
-            DEFAULT_MODEL_URL, progress=True
+        # CoreML only supports batch=1; override silently
+        if batch_size > 1:
+            print(f"    Note: CoreML forces batch_size=1 (was {batch_size})")
+        batch_size = 1
+        # CoreML model was traced at 1536x1536; override internal_shape
+        internal_shape = (1536, 1536)
+        # fp16 is baked into the CoreML model; no autocast needed
+        use_fp16 = False
+        device_obj = torch.device("cpu")  # CoreML manages its own devices
+    else:
+        # PyTorch path
+        from sharp.models import PredictorParams, create_predictor
+
+        print(f"    Device: {device}")
+        print(f"    Batch size: {batch_size}")
+        print(f"    Internal shape: {internal_shape[0]}x{internal_shape[1]}")
+        print(f"    Precision: {'fp16 (autocast)' if use_fp16 else 'fp32'}")
+
+        # Auto-detect device
+        if device == "default":
+            if torch.cuda.is_available():
+                device = "cuda"
+                print(f"    Using CUDA (GPU)")
+            elif torch.mps.is_available():
+                device = "mps"
+                print(f"    Using MPS (Apple Silicon GPU)")
+            else:
+                device = "cpu"
+                print(f"    Using CPU (will be slower)")
+
+        device_obj = torch.device(device)
+
+        # Load model
+        print(f"\n    Loading SHARP model...")
+        DEFAULT_MODEL_URL = (
+            "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
         )
 
-        gaussian_predictor = create_predictor(PredictorParams())
-        gaussian_predictor.load_state_dict(state_dict)
-        gaussian_predictor.eval()
-        gaussian_predictor.to(device_obj)
-        print(f"    Model loaded successfully")
-    except Exception as e:
-        print(f"\n    Error loading model: {e}")
-        return False
+        try:
+            print(f"    Downloading model from: {DEFAULT_MODEL_URL}")
+            state_dict = torch.hub.load_state_dict_from_url(
+                DEFAULT_MODEL_URL, progress=True
+            )
+
+            gaussian_predictor = create_predictor(PredictorParams())
+            gaussian_predictor.load_state_dict(state_dict)
+            gaussian_predictor.eval()
+            gaussian_predictor.to(device_obj)
+            print(f"    Model loaded successfully")
+        except Exception as e:
+            print(f"\n    Error loading model: {e}")
+            return False
 
     # Gather image paths
     extensions = io.get_supported_image_extensions()
@@ -687,6 +722,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "all frames are extracted regardless of the 'skip' argument."
         ),
     )
+    p.add_argument(
+        "--runtime",
+        default="pytorch",
+        choices=["pytorch", "coreml"],
+        help=(
+            "Inference runtime. 'coreml' uses an exported .mlpackage for "
+            "~1.5x speedup on Apple Silicon (M4 Max tested). Requires "
+            "prior export via scripts/export_coreml.py.  [default: pytorch]"
+        ),
+    )
+    p.add_argument(
+        "--coreml-model",
+        default="sharp.mlpackage",
+        metavar="PATH",
+        dest="coreml_model",
+        help=(
+            "Path to the exported CoreML .mlpackage (only used with "
+            "--runtime coreml).  [default: sharp.mlpackage]"
+        ),
+    )
 
     return p
 
@@ -712,6 +767,8 @@ def main():
     internal_shape = (args.internal_shape, args.internal_shape)
     use_fp16 = not args.fp32
     keyframe_interval = args.keyframe_interval
+    runtime = args.runtime
+    coreml_model = args.coreml_model
 
     if frame_skip < 1:
         print("Error: Frame skip must be >= 1")
@@ -772,6 +829,8 @@ def main():
         internal_shape=internal_shape,
         use_fp16=use_fp16,
         keyframe_interval=keyframe_interval,
+        runtime=runtime,
+        coreml_model=coreml_model,
     )
 
     if not success:
